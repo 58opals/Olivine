@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 description = "A trusted-peer Bitcoin Cash mainnet headers client"
+license = "MIT"
+repository = "https://github.com/58opals/Olivine"
 
 [dependencies]
 bitcoin_hashes = { version = "=0.14.0", default-features = false }

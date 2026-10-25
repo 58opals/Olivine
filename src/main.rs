@@ -34,9 +34,13 @@ checkpoint on later runs. The parent directory must already exist.
 returns no headers. --watch additionally polls for new headers every 30
 seconds by default. --poll-seconds accepts 1 through 3600 with --watch.
 Stop watching with Ctrl-C. Without either mode, download one batch and exit.
+Sync/watch retry transient connection failures up to three times per run,
+after delays of 1, 2, and 4 seconds, using the same configured peer and saved
+tip. Progress does not reset the retry budget. One-batch mode is fail-fast.
 
 This command checks message integrity and header linkage. It trusts the peer
-for consensus and chain selection. Errors stop without discarding saved progress.
+for consensus and chain selection. Invalid data and storage errors stop
+immediately without discarding saved progress.
 
 Options:
   --help, -h    Show this help
@@ -210,24 +214,22 @@ fn run() -> io::Result<()> {
             display_hash(&config.checkpoint.hash)
         );
     }
-    println!(
-        "Connecting to {} from height {} hash {}",
-        config.peer,
-        config.checkpoint.height,
-        display_hash(&config.checkpoint.hash)
-    );
-    let mut session = client::PeerSession::connect(&config)?;
-    println!(
-        "Handshake complete with {} (protocol {}, services {:#x}, advertised height {})",
-        session.peer(),
-        session.version().protocol,
-        session.version().services,
-        session.version().start_height
-    );
+    let mut retries = 0;
+    let mut session = connect_with_retry(&config, mode, &mut retries)?;
     let mut at_tip = false;
     let mut watching = false;
     loop {
-        let download = session.request_headers(config.checkpoint)?;
+        let download = match session.request_headers(config.checkpoint) {
+            Ok(download) => download,
+            Err(error) => {
+                drop(session);
+                retry_network(error, mode, &mut retries)?;
+                session = connect_with_retry(&config, mode, &mut retries)?;
+                at_tip = false;
+                watching = false;
+                continue;
+            }
+        };
         if let Some(store) = &mut store {
             store.append(&download.headers).map_err(store_error)?;
         }
@@ -272,12 +274,66 @@ fn run() -> io::Result<()> {
                 watching = true;
             }
             io::stdout().flush()?;
-            session.wait_for_poll(poll_interval)?;
+            if let Err(error) = session.wait_for_poll(poll_interval) {
+                drop(session);
+                retry_network(error, mode, &mut retries)?;
+                session = connect_with_retry(&config, mode, &mut retries)?;
+                at_tip = false;
+                watching = false;
+            }
         } else {
             at_tip = false;
             io::stdout().flush()?;
         }
     }
+}
+
+fn connect_with_retry(
+    config: &Config,
+    mode: Mode,
+    retries: &mut u32,
+) -> io::Result<client::PeerSession> {
+    loop {
+        println!(
+            "Connecting to {} from height {} hash {}",
+            config.peer,
+            config.checkpoint.height,
+            display_hash(&config.checkpoint.hash)
+        );
+        io::stdout().flush()?;
+        match client::PeerSession::connect(config) {
+            Ok(session) => {
+                println!(
+                    "Handshake complete with {} (protocol {}, services {:#x}, advertised height {})",
+                    session.peer(),
+                    session.version().protocol,
+                    session.version().services,
+                    session.version().start_height
+                );
+                return Ok(session);
+            }
+            Err(error) => retry_network(error, mode, retries)?,
+        }
+    }
+}
+
+fn retry_network(error: client::ClientError, mode: Mode, retries: &mut u32) -> io::Result<()> {
+    const MAX_RETRIES: u32 = 3;
+    if mode == Mode::Once || !error.is_retryable() {
+        return Err(error.into());
+    }
+    if *retries == MAX_RETRIES {
+        let error: io::Error = error.into();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("reconnect retry budget exhausted after {MAX_RETRIES} retries: {error}"),
+        ));
+    }
+    let delay = 1_u64 << *retries;
+    *retries += 1;
+    eprintln!("Connection failed: {error}; retry {retries}/{MAX_RETRIES} in {delay} seconds");
+    std::thread::sleep(Duration::from_secs(delay));
+    Ok(())
 }
 
 fn store_error(error: io::Error) -> io::Error {

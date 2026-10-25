@@ -4,7 +4,7 @@ Olivine is a Bitcoin Cash mainnet headers client written in Rust. It connects to
 
 Olivine completes a `version`/`verack` handshake and downloads batches of up to 2,000 headers. It verifies BCH mainnet message magic, payload bounds, checksums, canonical length encodings, and header linkage through every batch. With `--headers-file`, it saves progress locally and resumes from the saved tip. `--sync` catches up automatically, while `--watch` continues polling for new headers. Without either mode, it downloads one batch and exits.
 
-The peer supplies consensus and chain selection. Olivine does not independently validate proof of work, difficulty, timestamps, or accumulated chainwork. A response that does not extend the checkpoint or saved tip stops the download; there is no automatic fork selection or reorganisation recovery. Network and storage errors also stop the client; restart with the same file and original checkpoint to resume.
+The peer supplies consensus and chain selection. Olivine does not independently validate proof of work, difficulty, timestamps, or accumulated chainwork. A response that does not extend the checkpoint or saved tip stops the download; there is no automatic fork selection or reorganisation recovery. Sync/watch modes retry recognized transient transport failures against the same configured endpoint. Protocol, checksum, local input and storage failures stop immediately; restart with the same file and original checkpoint to resume.
 
 ## Build and run
 
@@ -57,7 +57,15 @@ cargo run --locked -- \
 
 `--sync` and `--watch` are mutually exclusive and both require a headers file. The client reports each saved batch's height/hash and reports when it catches up. Quiet polls do not repeat progress messages. Stop watching with Ctrl-C, then run the same command to resume. Keep using the original checkpoint rather than replacing it with the saved tip.
 
-Each headers request receives a fresh response deadline. While waiting to poll, the client handles peer pings and finishes any started message under the normal network timeout before issuing its next request. A slow partial frame can therefore delay a poll by up to that timeout; it cannot reset the timeout indefinitely or be discarded between requests. Disconnects stop clearly rather than silently choosing another peer.
+Each headers request receives a fresh response deadline. While waiting to poll, the client handles peer pings and finishes any started message under the normal network timeout before issuing its next request. A slow partial frame can therefore delay a poll by up to that timeout; it cannot reset the timeout indefinitely or be discarded between requests on a healthy connection.
+
+## Reconnect after transport failures
+
+`--sync` and `--watch` share a budget of three retries per invocation, after backoff delays of 1, 2 and 4 seconds. The initial connection plus three retries permits at most four connection attempts. Saving headers or catching up does not reset the budget, so a repeatedly disconnecting peer cannot keep the run retrying indefinitely. Normal network timeouts still apply to each attempt in addition to backoff delays. One-batch mode remains fail-fast.
+
+Retries use the same configured endpoint, perform a new handshake and resume from the last durably saved height/hash. The file remains locked during backoff and reconnect. A partially received batch is discarded with the failed connection, and the next request starts from committed progress. Hostnames are resolved normally on each connection attempt; there is no seed discovery or automatic endpoint substitution.
+
+Recognized connection refusals, disconnects, timeouts and other transport failures are retryable. A completely received malformed message, wrong network, checksum failure, divergent chain, local setup failure or storage failure is not. Unknown errors also stop rather than being retried blindly. After the retry budget is exhausted, the client exits with an error and leaves committed progress available for a later run.
 
 ## Verify
 
@@ -67,10 +75,10 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Tests use fixed protocol/storage fixtures and local scripted TCP peers. They do not contact a public peer. They cover framing, linkage, file integrity, restart/resume, automatic catch-up, idle ping handling, new-header polling, and preservation of saved progress on failed downloads. They do not establish independent BCH consensus validation or prove physical power-loss durability.
+Tests use fixed protocol/storage fixtures and local scripted TCP peers. They do not contact a public peer. They cover framing, linkage, file integrity, restart/resume, automatic catch-up, idle ping handling, new-header polling, bounded reconnection, and preservation of saved progress on failed downloads. They do not establish independent BCH consensus validation or prove physical power-loss durability.
 
 ## Protocol references and dependencies
 
 The wire implementation follows the [BCH network message reference](https://documentation.cash/protocol/network/messages.html) and [Bitcoin Cash Node](https://github.com/bitcoin-cash-node/bitcoin-cash-node), including its mainnet message magic and protocol version. The deprecated transaction-count field in each `headers` entry is decoded and ignored, as in BCHN.
 
-Double SHA-256 uses [`bitcoin_hashes`](https://github.com/rust-bitcoin/rust-bitcoin/tree/bitcoin_hashes-0.14.0/hashes), licensed under CC0-1.0, with default features disabled. The dependency graph contains Rust crates and needs no C/C++ library or FFI wrapper. Project licensing has not yet been selected, and Cargo publication is disabled.
+Olivine is provided under the [MIT license](LICENSE), copyright 2026 Coda Beatrix. Double SHA-256 uses [`bitcoin_hashes`](https://github.com/rust-bitcoin/rust-bitcoin/tree/bitcoin_hashes-0.14.0/hashes), licensed under CC0-1.0, with default features disabled. The dependency graph contains Rust crates and needs no C/C++ library or FFI wrapper. [Third-party notices](THIRD_PARTY_NOTICES.md) identify the locked dependencies and their license texts. Cargo registry publication is disabled.
