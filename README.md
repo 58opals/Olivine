@@ -2,9 +2,9 @@
 
 Olivine is a Bitcoin Cash mainnet headers client written in Rust. It connects to one explicitly selected trusted peer, starting from an explicitly supplied trusted checkpoint.
 
-The current executable completes a `version`/`verack` handshake and downloads one batch of up to 2,000 headers. It verifies BCH mainnet message magic, payload bounds, checksums, canonical length encodings, and header linkage through the entire batch. With `--headers-file`, it saves progress locally and resumes from the saved tip on the next run. It reports the resulting height and block hash, then exits. An empty response leaves progress unchanged.
+Olivine completes a `version`/`verack` handshake and downloads batches of up to 2,000 headers. It verifies BCH mainnet message magic, payload bounds, checksums, canonical length encodings, and header linkage through every batch. With `--headers-file`, it saves progress locally and resumes from the saved tip. `--sync` catches up automatically, while `--watch` continues polling for new headers. Without either mode, it downloads one batch and exits.
 
-The peer supplies consensus and chain selection. Olivine does not independently validate proof of work, difficulty, timestamps, or accumulated chainwork. A response that does not extend the checkpoint or saved tip stops the download; there is no automatic fork selection or reorganisation recovery. The current executable does not catch up across multiple batches or poll for new blocks automatically yet.
+The peer supplies consensus and chain selection. Olivine does not independently validate proof of work, difficulty, timestamps, or accumulated chainwork. A response that does not extend the checkpoint or saved tip stops the download; there is no automatic fork selection or reorganisation recovery. Network and storage errors also stop the client; restart with the same file and original checkpoint to resume.
 
 ## Build and run
 
@@ -30,7 +30,7 @@ These are placeholders. Select and verify the peer and checkpoint before making 
 
 ## Save and resume
 
-Add `--headers-file PATH` to save progress. The parent directory must already exist. Run the same command again with the same original checkpoint height/hash and file path; Olivine validates the saved file before connecting and requests the next batch from its saved tip. Each invocation still downloads only one batch. Without this option the download remains in memory.
+Add `--headers-file PATH` to save progress. The parent directory must already exist. Run the same command again with the same original checkpoint height/hash and file path; Olivine validates the saved file before connecting and requests headers from its saved tip. Without a mode flag, each invocation downloads only one batch. Without a file option, that one-batch download remains in memory.
 
 The file records the network, original checkpoint, and linked headers, with a checksum covering the complete snapshot. A mismatched checkpoint, malformed file, failed checksum, or broken link stops before any network connection or replacement of existing progress. A divergent response or interrupted download leaves saved progress unchanged.
 
@@ -40,6 +40,25 @@ A companion `PATH.lock` file prevents concurrent writers. It remains on disk; it
 
 The initial storage format is `OLIVHDR1` (8 bytes), BCH mainnet magic (4), original checkpoint height (little-endian u32), checkpoint hash (32 wire-order bytes), header count (little-endian u64), raw 80-byte headers, then a 32-byte double-SHA256 checksum of all preceding bytes. Current height and hash are derived from the validated headers. Snapshot replacement favors simple recovery; its write cost will need reassessment for large multi-batch historical downloads.
 
+## Catch up and watch
+
+Add `--sync` and `--headers-file PATH` to catch up and exit. The client reuses one peer connection, saves each valid batch before advancing its locator, and continues until the peer returns no headers. A short nonempty batch does not end catch-up. The peer's advertised height is informational; an empty response means caught up with that peer at that moment.
+
+Use `--watch` instead of `--sync` to catch up and keep polling. The default interval is 30 seconds; `--poll-seconds` accepts 1–3,600 seconds with `--watch`. For example, after replacing the placeholders:
+
+```sh
+cargo run --locked -- \
+  --peer YOUR_TRUSTED_PEER:8333 \
+  --checkpoint-height YOUR_CHECKPOINT_HEIGHT \
+  --checkpoint-hash YOUR_CHECKPOINT_HASH \
+  --headers-file /path/to/headers.dat \
+  --watch --poll-seconds 30
+```
+
+`--sync` and `--watch` are mutually exclusive and both require a headers file. The client reports each saved batch's height/hash and reports when it catches up. Quiet polls do not repeat progress messages. Stop watching with Ctrl-C, then run the same command to resume. Keep using the original checkpoint rather than replacing it with the saved tip.
+
+Each headers request receives a fresh response deadline. While waiting to poll, the client handles peer pings and finishes any started message under the normal network timeout before issuing its next request. A slow partial frame can therefore delay a poll by up to that timeout; it cannot reset the timeout indefinitely or be discarded between requests. Disconnects stop clearly rather than silently choosing another peer.
+
 ## Verify
 
 ```sh
@@ -48,7 +67,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Tests use fixed protocol/storage fixtures and local scripted TCP peers. They do not contact a public peer. They cover framing, linkage, file integrity, restart/resume, and preservation of saved progress on failed downloads. They do not establish independent BCH consensus validation or prove physical power-loss durability.
+Tests use fixed protocol/storage fixtures and local scripted TCP peers. They do not contact a public peer. They cover framing, linkage, file integrity, restart/resume, automatic catch-up, idle ping handling, new-header polling, and preservation of saved progress on failed downloads. They do not establish independent BCH consensus validation or prove physical power-loss durability.
 
 ## Protocol references and dependencies
 

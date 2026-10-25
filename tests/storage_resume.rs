@@ -335,7 +335,7 @@ fn interrupted_download_preserves_the_previous_store() {
     });
     assert!(!output.status.success());
     assert!(
-        text(&output.stderr).contains("first headers download"),
+        text(&output.stderr).contains("headers download"),
         "{}",
         text(&output.stderr)
     );

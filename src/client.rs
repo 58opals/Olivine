@@ -23,10 +23,15 @@ pub struct Config {
 }
 
 pub struct Download {
-    pub peer: SocketAddr,
-    pub version: PeerVersion,
     pub headers: Vec<[u8; 80]>,
     pub tip: Checkpoint,
+}
+
+pub struct PeerSession {
+    connection: Connection,
+    peer: SocketAddr,
+    version: PeerVersion,
+    timeout: Duration,
 }
 
 // A phase deadline covers all reads, including partial frames and unrelated
@@ -87,52 +92,140 @@ impl Write for Connection {
     }
 }
 
-pub fn download_first_headers(config: &Config) -> io::Result<Download> {
-    let mut connection = Connection::connect(&config.peer, config.timeout)
-        .map_err(|error| context("connect", error))?;
-    let peer = connection.stream.peer_addr()?;
-    // Do not advertise the machine's private interface address to the peer.
-    let local = SocketAddr::from(([0, 0, 0, 0], 0));
-    let mut nonce = [0_u8; 8];
-    File::open("/dev/urandom")?.read_exact(&mut nonce)?;
-    let nonce = u64::from_le_bytes(nonce);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| {
-            io::Error::new(
+impl PeerSession {
+    pub fn connect(config: &Config) -> io::Result<Self> {
+        if config.checkpoint.height > i32::MAX as u32 {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "system time precedes Unix epoch",
-            )
-        })?
-        .as_secs() as i64;
+                "checkpoint height exceeds the protocol's signed height range",
+            ));
+        }
+        let mut connection = Connection::connect(&config.peer, config.timeout)
+            .map_err(|error| context("connect", error))?;
+        let peer = connection.stream.peer_addr()?;
+        // Do not advertise the machine's private interface address to the peer.
+        let local = SocketAddr::from(([0, 0, 0, 0], 0));
+        let mut nonce = [0_u8; 8];
+        File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+        let nonce = u64::from_le_bytes(nonce);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "system time precedes Unix epoch",
+                )
+            })?
+            .as_secs() as i64;
 
-    connection.begin_phase(config.timeout);
-    let version = handshake(
-        &mut connection,
-        peer,
-        local,
-        nonce,
-        timestamp,
-        config.checkpoint.height,
-    )
-    .map_err(|error| context("handshake", error))?;
-    connection.begin_phase(config.timeout);
-    let headers = request_headers(&mut connection, &version, &config.checkpoint.hash)
-        .map_err(|error| context("first headers download", error))?;
-    let height = config
-        .checkpoint
-        .height
-        .checked_add(headers.len() as u32)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "header height overflow"))?;
-    let hash = headers
-        .last()
-        .map_or(config.checkpoint.hash, |header| sha256d(header));
-    Ok(Download {
-        peer,
-        version,
-        headers,
-        tip: Checkpoint { height, hash },
-    })
+        connection.begin_phase(config.timeout);
+        let version = handshake(
+            &mut connection,
+            peer,
+            local,
+            nonce,
+            timestamp,
+            config.checkpoint.height,
+        )
+        .map_err(|error| context("handshake", error))?;
+        Ok(Self {
+            connection,
+            peer,
+            version,
+            timeout: config.timeout,
+        })
+    }
+
+    pub fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+
+    pub fn version(&self) -> &PeerVersion {
+        &self.version
+    }
+
+    pub fn request_headers(&mut self, checkpoint: Checkpoint) -> io::Result<Download> {
+        if checkpoint.height > i32::MAX as u32 {
+            return Err(invalid(
+                "checkpoint height exceeds the protocol's signed height range",
+            ));
+        }
+        self.connection.begin_phase(self.timeout);
+        let headers = request_headers(&mut self.connection, &self.version, &checkpoint.hash)
+            .map_err(|error| context("headers download", error))?;
+        let height = checkpoint
+            .height
+            .checked_add(headers.len() as u32)
+            .filter(|height| *height <= i32::MAX as u32)
+            .ok_or_else(|| {
+                invalid("downloaded header height exceeds the protocol's signed height range")
+            })?;
+        let hash = headers
+            .last()
+            .map_or(checkpoint.hash, |header| sha256d(header));
+        Ok(Download {
+            headers,
+            tip: Checkpoint { height, hash },
+        })
+    }
+
+    pub fn wait_for_poll(&mut self, interval: Duration) -> io::Result<()> {
+        let deadline = Instant::now().checked_add(interval).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "poll interval is too large")
+        })?;
+        loop {
+            let Some(wait) = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|wait| !wait.is_zero())
+            else {
+                return Ok(());
+            };
+            self.connection.stream.set_read_timeout(Some(wait))?;
+            let mut byte = [0_u8; 1];
+            match self.connection.stream.peek(&mut byte) {
+                Ok(0) => {
+                    return Err(context(
+                        "poll wait",
+                        io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "peer disconnected while waiting to poll",
+                        ),
+                    ));
+                }
+                Ok(_) => {
+                    // Peek consumes no bytes. Once a frame starts, finish it
+                    // under the normal phase deadline before checking whether
+                    // polling is due; never discard a partially read frame.
+                    self.connection.begin_phase(self.timeout);
+                    let message = read_message(&mut self.connection)
+                        .map_err(|error| context("poll wait", error))?;
+                    match message.command.as_str() {
+                        "version" | "verack" => {
+                            return Err(invalid(
+                                "unexpected repeated handshake message while waiting to poll",
+                            ));
+                        }
+                        "headers" => {
+                            return Err(invalid("unsolicited headers while waiting to poll"));
+                        }
+                        _ => handle_control(&mut self.connection, &message, self.version.protocol)
+                            .map_err(|error| context("poll wait", error))?,
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // Read timeouts may expire just before the Instant deadline.
+                    // Recheck it at the top of the loop rather than failing.
+                }
+                Err(error) => return Err(context("poll wait", error)),
+            }
+        }
+    }
 }
 
 fn handshake(

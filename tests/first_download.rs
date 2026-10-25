@@ -209,7 +209,7 @@ fn divergent_batch_fails_without_reporting_download_success() {
     });
     assert!(!output.status.success());
     let stderr = text(&output.stderr);
-    assert!(stderr.contains("first headers download"), "{stderr}");
+    assert!(stderr.contains("headers download"), "{stderr}");
     assert!(stderr.contains("diverges"), "{stderr}");
     assert!(!text(&output.stdout).contains("Received 1 linked headers"));
 }
@@ -238,7 +238,7 @@ fn stalled_partial_frame_exits_on_the_phase_deadline() {
         }
     });
     assert!(!output.status.success());
-    assert!(text(&output.stderr).contains("first headers download"));
+    assert!(text(&output.stderr).contains("headers download"));
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "partial reads kept the phase alive"

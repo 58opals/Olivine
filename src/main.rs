@@ -2,7 +2,13 @@ mod client;
 mod protocol;
 mod store;
 
-use std::{env, io, path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    env,
+    io::{self, Write},
+    path::PathBuf,
+    process::ExitCode,
+    time::Duration,
+};
 
 use client::{Checkpoint, Config};
 use protocol::{display_hash, parse_hash};
@@ -12,7 +18,8 @@ const HELP: &str = "Olivine — trusted-peer Bitcoin Cash mainnet headers client
 
 Usage:
   olivine --peer HOST:PORT --checkpoint-height HEIGHT --checkpoint-hash HASH
-          [--headers-file PATH] [--timeout-seconds SECONDS]
+          [--headers-file PATH] [--sync | --watch [--poll-seconds SECONDS]]
+          [--timeout-seconds SECONDS]
 
 Connect to one trusted peer, complete version/verack, and request one batch
 of up to 2,000 headers extending the checkpoint. HASH is the 64-character
@@ -23,9 +30,13 @@ With --headers-file, validate saved progress before connecting, resume from
 its tip, and durably save the downloaded batch. Keep supplying the original
 checkpoint on later runs. The parent directory must already exist.
 
+--sync requires --headers-file and saves successive batches until the peer
+returns no headers. --watch additionally polls for new headers every 30
+seconds by default. --poll-seconds accepts 1 through 3600 with --watch.
+Stop watching with Ctrl-C. Without either mode, download one batch and exit.
+
 This command checks message integrity and header linkage. It trusts the peer
-for consensus and chain selection. Each run downloads one batch; it does
-not yet catch up automatically or poll.
+for consensus and chain selection. Errors stop without discarding saved progress.
 
 Options:
   --help, -h    Show this help
@@ -34,6 +45,15 @@ Options:
 struct Arguments {
     config: Config,
     headers_file: Option<PathBuf>,
+    mode: Mode,
+    poll_interval: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    Once,
+    Sync,
+    Watch,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> io::Result<Option<Arguments>> {
@@ -42,6 +62,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<Option<Arguments
     let mut hash = None;
     let mut timeout = None;
     let mut headers_file = None;
+    let mut mode = None;
+    let mut poll_interval = None;
     let mut args = args.peekable();
     if args.peek().is_none() {
         return Err(input_error(
@@ -52,6 +74,17 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<Option<Arguments
         if flag == "--help" || flag == "-h" {
             return Ok(None);
         }
+        if flag == "--sync" || flag == "--watch" {
+            let selected = if flag == "--sync" {
+                Mode::Sync
+            } else {
+                Mode::Watch
+            };
+            if mode.replace(selected).is_some() {
+                return Err(input_error("specify --sync or --watch only once"));
+            }
+            continue;
+        }
         if !matches!(
             flag.as_str(),
             "--peer"
@@ -59,6 +92,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<Option<Arguments
                 | "--checkpoint-hash"
                 | "--timeout-seconds"
                 | "--headers-file"
+                | "--poll-seconds"
         ) {
             return Err(input_error(format!("unknown option: {flag}")));
         }
@@ -106,12 +140,32 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<Option<Arguments
                     return Err(input_error("--headers-file specified more than once"));
                 }
             }
+            "--poll-seconds" => {
+                let value: u64 = value
+                    .parse()
+                    .map_err(|_| input_error("invalid polling interval"))?;
+                if !(1..=3600).contains(&value) {
+                    return Err(input_error(
+                        "polling interval must be between 1 and 3600 seconds",
+                    ));
+                }
+                if poll_interval.replace(Duration::from_secs(value)).is_some() {
+                    return Err(input_error("--poll-seconds specified more than once"));
+                }
+            }
             _ => unreachable!(),
         }
     }
     let peer = peer.ok_or_else(|| input_error("--peer is required"))?;
     if peer.trim().is_empty() {
         return Err(input_error("--peer must be a host:port endpoint"));
+    }
+    let mode = mode.unwrap_or(Mode::Once);
+    if mode != Mode::Once && headers_file.is_none() {
+        return Err(input_error("--sync and --watch require --headers-file"));
+    }
+    if mode != Mode::Watch && poll_interval.is_some() {
+        return Err(input_error("--poll-seconds requires --watch"));
     }
     Ok(Some(Arguments {
         config: Config {
@@ -123,6 +177,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<Option<Arguments
             timeout: timeout.unwrap_or(Duration::from_secs(30)),
         },
         headers_file,
+        mode,
+        poll_interval: poll_interval.unwrap_or(Duration::from_secs(30)),
     }))
 }
 
@@ -134,6 +190,8 @@ fn run() -> io::Result<()> {
     let Some(Arguments {
         mut config,
         headers_file,
+        mode,
+        poll_interval,
     }) = parse_args(env::args().skip(1))?
     else {
         print!("{HELP}");
@@ -158,33 +216,68 @@ fn run() -> io::Result<()> {
         config.checkpoint.height,
         display_hash(&config.checkpoint.hash)
     );
-    let download = client::download_first_headers(&config)?;
-    if let Some(store) = &mut store {
-        store.append(&download.headers).map_err(store_error)?;
-    }
+    let mut session = client::PeerSession::connect(&config)?;
     println!(
         "Handshake complete with {} (protocol {}, services {:#x}, advertised height {})",
-        download.peer,
-        download.version.protocol,
-        download.version.services,
-        download.version.start_height
+        session.peer(),
+        session.version().protocol,
+        session.version().services,
+        session.version().start_height
     );
-    println!(
-        "Received {} linked headers; height {} hash {}",
-        download.headers.len(),
-        download.tip.height,
-        display_hash(&download.tip.hash)
-    );
-    if let Some(store) = &store {
-        let tip = store.tip();
-        println!(
-            "Stored {} headers; height {} hash {}",
-            store.header_count(),
-            tip.height,
-            display_hash(&tip.hash)
-        );
+    let mut at_tip = false;
+    let mut watching = false;
+    loop {
+        let download = session.request_headers(config.checkpoint)?;
+        if let Some(store) = &mut store {
+            store.append(&download.headers).map_err(store_error)?;
+        }
+        // Advance the next locator only after durable storage has succeeded.
+        config.checkpoint = download.tip;
+        if !download.headers.is_empty() || mode == Mode::Once {
+            println!(
+                "Received {} linked headers; height {} hash {}",
+                download.headers.len(),
+                download.tip.height,
+                display_hash(&download.tip.hash)
+            );
+            if let Some(store) = &store {
+                println!(
+                    "Stored {} headers; height {} hash {}",
+                    store.header_count(),
+                    store.tip().height,
+                    display_hash(&store.tip().hash)
+                );
+            }
+        }
+        if mode == Mode::Once {
+            return Ok(());
+        }
+        if download.headers.is_empty() {
+            if !at_tip {
+                println!(
+                    "Caught up with peer; height {} hash {}",
+                    download.tip.height,
+                    display_hash(&download.tip.hash)
+                );
+                at_tip = true;
+            }
+            if mode == Mode::Sync {
+                return Ok(());
+            }
+            if !watching {
+                println!(
+                    "Watching for new headers every {} seconds",
+                    poll_interval.as_secs()
+                );
+                watching = true;
+            }
+            io::stdout().flush()?;
+            session.wait_for_poll(poll_interval)?;
+        } else {
+            at_tip = false;
+            io::stdout().flush()?;
+        }
     }
-    Ok(())
 }
 
 fn store_error(error: io::Error) -> io::Error {
@@ -224,6 +317,7 @@ mod tests {
     fn explicit_inputs_and_defaults() {
         let arguments = parse_args(args(&[]).into_iter()).unwrap().unwrap();
         assert!(arguments.headers_file.is_none());
+        assert_eq!(arguments.mode, Mode::Once);
         let config = arguments.config;
         assert_eq!(config.peer, "127.0.0.1:8333");
         assert_eq!(config.checkpoint.height, 0);
@@ -240,6 +334,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(arguments.headers_file, Some(PathBuf::from("headers.dat")));
+    }
+
+    #[test]
+    fn sync_and_watch_require_storage_and_validate_polling() {
+        for extra in [
+            vec!["--sync"],
+            vec!["--watch"],
+            vec!["--poll-seconds", "1"],
+            vec!["--headers-file", "a", "--sync", "--watch"],
+            vec!["--headers-file", "a", "--sync", "--sync"],
+            vec!["--headers-file", "a", "--watch", "--poll-seconds", "0"],
+            vec!["--headers-file", "a", "--watch", "--poll-seconds", "3601"],
+        ] {
+            assert!(parse_args(args(&extra).into_iter()).is_err());
+        }
+        let watch = parse_args(args(&["--headers-file", "a", "--watch"]).into_iter())
+            .unwrap()
+            .unwrap();
+        assert_eq!(watch.mode, Mode::Watch);
+        assert_eq!(watch.poll_interval, Duration::from_secs(30));
+        let sync = parse_args(args(&["--headers-file", "a", "--sync"]).into_iter())
+            .unwrap()
+            .unwrap();
+        assert_eq!(sync.mode, Mode::Sync);
     }
 
     #[test]
