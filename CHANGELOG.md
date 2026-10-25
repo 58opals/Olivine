@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 - 2026-10-25
+
+Initial trusted-peer Bitcoin Cash headers-client release.
 
 - Add a pure Rust Bitcoin Cash mainnet headers client for one explicitly configured peer and trusted checkpoint.
 - Complete the `version`/`verack` handshake and download batches of up to 2,000 headers, checking message integrity, bounded parsing and sequential header linkage.
